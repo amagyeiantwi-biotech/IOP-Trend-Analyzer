@@ -1,0 +1,186 @@
+# ============================================================
+# IOP Trend Analyzer — one-cell, upload-friendly (CSV/XLSX)
+# ============================================================
+
+!pip install -q pandas numpy matplotlib openpyxl
+
+import os, io
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# --------------------------
+# CONFIG (edit if needed)
+# --------------------------
+DATA_FILE = "sample_iop_data_small.csv"  # if this file exists in the runtime, it's used; else you'll be prompted to upload
+HIGH_IOP_THRESHOLD = 21                  # mmHg
+BORDERLINE_LOW, BORDERLINE_HIGH = 19, 21 # 19–21 = borderline bucket
+STABLE_SLOPE_BAND = 0.2                  # |slope| <= 0.2 mmHg/month => "Stable"
+N_EXAMPLE_PLOTS = 6                      # how many patient trend PNGs to save
+
+# --------------------------
+# LOAD DATA (CSV/XLSX or prompt)
+# --------------------------
+def load_df():
+    """
+    Loads CSV/XLSX if DATA_FILE exists; otherwise prompts for upload (Colab).
+    Required columns: PatientID, Date, IOP_OD, IOP_OS
+    """
+    def _finalize(df, source_name):
+        needed = {"PatientID","Date","IOP_OD","IOP_OS"}
+        if not needed.issubset(df.columns):
+            raise ValueError(f"Expected columns {needed}, found {set(df.columns)} in '{source_name}'")
+        df["PatientID"] = df["PatientID"].astype(str)
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).sort_values(["PatientID","Date"]).reset_index(drop=True)
+        print(f"[Loaded] {source_name}  →  rows={len(df)}  patients={df['PatientID'].nunique()}")
+        return df
+
+    if os.path.exists(DATA_FILE):
+        if DATA_FILE.lower().endswith((".xlsx",".xls")):
+            return _finalize(pd.read_excel(DATA_FILE), DATA_FILE)
+        return _finalize(pd.read_csv(DATA_FILE), DATA_FILE)
+
+    # Prompt for upload
+    try:
+        from google.colab import files  # type: ignore
+        print("Upload CSV/Excel with columns: PatientID, Date, IOP_OD, IOP_OS")
+        uploaded = files.upload()
+        fname = list(uploaded.keys())[0]
+        if fname.lower().endswith((".xlsx",".xls")):
+            df = pd.read_excel(io.BytesIO(uploaded[fname]))
+        else:
+            df = pd.read_csv(io.BytesIO(uploaded[fname]))
+        return _finalize(df, fname)
+    except Exception as e:
+        raise FileNotFoundError(
+            f"'{DATA_FILE}' not found and upload not available. "
+            "Place your CSV/XLSX in the working directory or set DATA_FILE to your filename."
+        ) from e
+
+df = load_df()
+display(df.head())
+
+# --------------------------
+# ANALYSIS
+# --------------------------
+# Aggregate per patient
+agg = df.groupby("PatientID").agg(
+    First_Date=("Date","min"),
+    Last_Date =("Date","max"),
+    Max_OD    =("IOP_OD","max"),
+    Max_OS    =("IOP_OS","max"),
+    Mean_OD   =("IOP_OD","mean"),
+    Mean_OS   =("IOP_OS","mean"),
+)
+agg["Any_High_OD"] = (agg["Max_OD"] > HIGH_IOP_THRESHOLD).astype(int)
+agg["Any_High_OS"] = (agg["Max_OS"] > HIGH_IOP_THRESHOLD).astype(int)
+
+# Per-eye slope (mmHg/month) via simple linear regression on visit time
+def slope_mmHg_per_month(sub, col):
+    sub = sub.sort_values("Date").copy()
+    t = (sub["Date"] - sub["Date"].min()).dt.days / 30.0
+    y = sub[col].values
+    if t.nunique() <= 1:
+        return 0.0
+    m, b = np.polyfit(t, y, 1)
+    return float(m)
+
+slopes = []
+for pid, sub in df.groupby("PatientID"):
+    slopes.append([pid,
+                   slope_mmHg_per_month(sub, "IOP_OD"),
+                   slope_mmHg_per_month(sub, "IOP_OS")])
+slopes = pd.DataFrame(slopes, columns=["PatientID","Slope_OD","Slope_OS"]).set_index("PatientID")
+
+summary = agg.join(slopes)
+
+def classify_trend(s):
+    if s >  STABLE_SLOPE_BAND: return "Rising"
+    if s < -STABLE_SLOPE_BAND: return "Falling"
+    return "Stable"
+
+summary["Trend_OD"] = summary["Slope_OD"].apply(classify_trend)
+summary["Trend_OS"] = summary["Slope_OS"].apply(classify_trend)
+
+def bucket_mean(x):
+    if x > BORDERLINE_HIGH: return "High (>21)"
+    if x >= BORDERLINE_LOW: return "Borderline (19–21)"
+    return "Normal (≤18)"
+
+summary["Mean_Bucket_OD"] = summary["Mean_OD"].apply(bucket_mean)
+summary["Mean_Bucket_OS"] = summary["Mean_OS"].apply(bucket_mean)
+
+summary = summary.sort_index()
+summary_path = Path("iop_summary_by_patient.csv")
+summary.to_csv(summary_path, index=True)
+print(f"[✓] Saved summary: {summary_path.resolve()}")
+
+# --------------------------
+# COHORT PLOTS (inline + PNG)
+# --------------------------
+# Trend distribution (OD + OS)
+trend_counts = pd.Series(
+    list(summary["Trend_OD"]) + list(summary["Trend_OS"])
+).value_counts().reindex(["Rising","Stable","Falling"]).fillna(0)
+
+plt.figure(figsize=(6.5,4.5))
+trend_counts.plot(kind="bar")
+plt.title("IOP Trend Distribution (OD + OS)")
+plt.ylabel("Number of Eyes"); plt.xlabel("Trend")
+plt.grid(axis="y", alpha=0.3); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(6.5,4.5))
+trend_counts.plot(kind="bar")
+plt.title("IOP Trend Distribution (OD + OS)")
+plt.ylabel("Number of Eyes"); plt.xlabel("Trend")
+plt.grid(axis="y", alpha=0.3); plt.tight_layout()
+plt.savefig("iop_trend_distribution.png", dpi=180); plt.close()
+
+# High-IOP flag counts
+flag_series = pd.Series(
+    (summary["Any_High_OD"]>0).astype(int).tolist() + (summary["Any_High_OS"]>0).astype(int).tolist()
+).value_counts().reindex([0,1]).fillna(0)
+flag_series.index = ["No High Visit", f"≥1 Visit > {HIGH_IOP_THRESHOLD}"]
+
+plt.figure(figsize=(6.5,4.5))
+flag_series.plot(kind="bar")
+plt.title(f"Eyes with ≥1 High IOP Visit (> {HIGH_IOP_THRESHOLD} mmHg)")
+plt.ylabel("Number of Eyes"); plt.xlabel("Flag")
+plt.grid(axis="y", alpha=0.3); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(6.5,4.5))
+flag_series.plot(kind="bar")
+plt.title(f"Eyes with ≥1 High IOP Visit (> {HIGH_IOP_THRESHOLD} mmHg)")
+plt.ylabel("Number of Eyes"); plt.xlabel("Flag")
+plt.grid(axis="y", alpha=0.3); plt.tight_layout()
+plt.savefig("iop_high_visit_flags.png", dpi=180); plt.close()
+print("[✓] Saved charts: iop_trend_distribution.png, iop_high_visit_flags.png")
+
+# --------------------------
+# PATIENT TREND PLOTS (inline + PNG)
+# --------------------------
+example_ids = list(summary.index[:min(N_EXAMPLE_PLOTS, len(summary.index))])
+for pid in example_ids:
+    sub = df[df["PatientID"]==pid].sort_values("Date")
+    x = sub["Date"]
+    plt.figure(figsize=(6.5,4.5))
+    plt.plot(x, sub["IOP_OD"], marker="o", label="OD")
+    plt.plot(x, sub["IOP_OS"], marker="o", label="OS")
+    plt.title(f"IOP Trend — {pid}")
+    plt.xlabel("Date"); plt.ylabel("IOP (mmHg)")
+    plt.xticks(rotation=30); plt.legend(); plt.grid(alpha=0.3)
+    plt.tight_layout(); plt.show()
+
+    # Save PNG
+    plt.figure(figsize=(6.5,4.5))
+    plt.plot(x, sub["IOP_OD"], marker="o", label="OD")
+    plt.plot(x, sub["IOP_OS"], marker="o", label="OS")
+    plt.title(f"IOP Trend — {pid}")
+    plt.xlabel("Date"); plt.ylabel("IOP (mmHg)")
+    plt.xticks(rotation=30); plt.legend(); plt.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig(f"{pid}_iop_trend.png", dpi=180); plt.close()
+
+print(f"[✓] Saved patient trend PNGs for: {', '.join(example_ids)}")
+print("\nDone. Files created: iop_summary_by_patient.csv, iop_trend_distribution.png, iop_high_visit_flags.png, <PID>_iop_trend.png")
